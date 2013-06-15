@@ -185,8 +185,9 @@ use POSIX qw(ENOENT EISDIR ENOTDIR ENOTEMPTY EINVAL ECONNABORTED EACCES EIO EPER
              S_IXUSR S_IXGRP S_IXOTH);
 use Carp 'croak';
 
-our $VERSION = '1.01';
+our $VERSION = '1.02';
 
+use constant SCHEMA_VERSION => 2;
 use constant MAX_PATH_LEN => 4096;  # characters
 use constant BLOCKSIZE    => 16384;  # bytes
 use constant FLUSHBLOCKS  => 256;    # flush after we've accumulated this many cached blocks
@@ -209,6 +210,9 @@ more of the following keys:
 
  ignore_permissions  If true, then Unix permission checking is not
                      performed when creating/reading/writing files.
+
+ allow_magic_dirs    If true, allow SQL statements in "magic" directories
+                     to be executed (see below).
 
 WARNING: Initializing the schema quietly destroys anything that might
 have been there before!
@@ -238,7 +242,10 @@ sub new {
 	%$options
     },$subclass;
 
+    local $self->{dbh};  # to avoid cloning database handle into child threads
+
     $self->initialize_schema if $options->{initialize};
+    $self->check_schema_version;
     return $self;
 }
 
@@ -254,6 +261,22 @@ sub ignore_permissions {
     my $self = shift;
     my $d    = $self->{ignore_permissions};
     $self->{ignore_permissions} = shift if @_;
+    $d;
+}
+
+=head2 $boolean = $fs->allow_magic_dirs([$boolean]);
+
+Get/set the allow_magic_dirs flag. If true, then directories whose
+names begin with "%%" will be searched for a dotfile named ".query"
+that contains a SQL statement to be run every time a directory listing
+is required from this directory. See getdir() below.
+
+=cut
+
+sub allow_magic_dirs {
+    my $self = shift;
+    my $d    = $self->{allow_magic_dirs};
+    $self->{allow_magic_dirs} = shift if @_;
     $d;
 }
 
@@ -740,8 +763,23 @@ Rename a file or directory. Raises a fatal exception if unsuccessful.
 sub rename {
     my $self = shift;
     my ($oldname,$newname) = @_;
-    $self->link($oldname,$newname);
-    $self->unlink($oldname);
+    my ($inode,$parent,$basename,$dynamic) = $self->path2inode($oldname);
+    die "permission denied" if $dynamic;
+
+    # if newname exists then this is an error
+    die "file exists" if eval{$self->path2inode($newname)};
+
+    my $newbase   = basename($newname);
+    my $newdir    = $self->_dirname($newname);
+    my $newparent = $self->path2inode($newdir); # also does path checking
+    $self->check_perm($parent,W_OK);            # can we update the old parent?
+    $self->check_perm($newparent,W_OK);         # can we update the new parent?
+
+    my $dbh = $self->dbh;
+    my $sth = $dbh->prepare_cached(
+	'update path set name=?,parent=? where parent=? and name=?');
+    $sth->execute($newbase,$newparent,$parent,$basename);
+    $sth->finish;
     1;
 }
 
@@ -757,7 +795,8 @@ will raise a fatal exception on any errors.
 sub unlink {
     my $self  = shift;
     my $path = shift;
-    my ($inode,$parent,$name)  = $self->path2inode($path) ;
+    my ($inode,$parent,$name,$dynamic)  = $self->path2inode($path);
+    die "permission denied" if $dynamic;
 
     $parent ||= 1;
     $self->check_perm($parent,W_OK);
@@ -836,11 +875,12 @@ filesystem with path loops.
 
 sub link {
     my $self = shift;
-    my ($oldpath,$newpath) = @_;
+    my ($oldpath,$newpath,$allow_dir_unlink) = @_;
     $self->check_perm(scalar $self->path2inode($self->_dirname($oldpath)),W_OK);
     $self->check_perm(scalar $self->path2inode($self->_dirname($newpath)),W_OK);
     my $inode  = $self->path2inode($oldpath);
-    $self->_isdir($inode) and die "hard links of directories not allowed";
+    $self->_isdir($inode) && !$allow_dir_unlink
+	and die "hard links of directories not allowed";
     eval {
 	$self->create_path($inode,$newpath);
     };
@@ -895,23 +935,164 @@ are also always returned. This method checks that the current user has
 read and execute permissions on the directory, and will raise a
 permission denied error if not (trap this with an eval{}).
 
+Experimental feature: If the directory begins with the magic
+characters "%%" then getdir will look for a dotfile named ".query"
+within the directory. ".query" must contain a SQL query that returns a
+series of one or more inodes. These will be used to populate the
+directory automagically. The query can span multiple lines, and 
+lines that begin with "#" will be ignored. For example:
+
+ # display all files greater than 2 Mb in size
+ select inode from metadata where size>2000000
+
+Another example, which uses MySQL-specific date/time
+math:
+
+ # all .jpg files created/modified within the last day
+ select m.inode from metadata as m,path as p
+     where p.name like '%.jpg'
+       and (now()-interval 1 day) <= m.mtime
+       and m.inode=p.inode
+
+Magic directories only populate files. Directories are excluded
+because of cycle issues.
+
 =cut
 
 sub getdir {
     my $self = shift;
     my $path = shift;
+
     my $inode = $self->path2inode($path);
     $self->_isdir($inode) or croak "not directory";
     $self->check_perm($inode,X_OK|R_OK);
-    return $self->_getdir($inode);
+    return $self->_getdir($inode,$path);
 }
 
 sub _getdir {
     my $self  = shift;
-    my $inode = shift;
+    my ($inode,$path) = @_;
     my $dbh   = $self->dbh;
     my $col   = $dbh->selectcol_arrayref("select name from path where parent=$inode");
+    if ($self->allow_magic_dirs && $self->_is_dynamic_dir($inode,$path)) {
+	my $dynamic = $self->get_dynamic_entries($inode,$path);
+	push @$col,keys %$dynamic if $dynamic;
+    }
     return '.','..',@$col;
+}
+
+# user has passed a SQL WHERE clause as a directory name
+sub _sql_directory {
+    my $self = shift;
+    my $path = shift;
+    (my $where = $path) =~ s/^%(?:where)?//;
+    my $dbh    = $self->dbh;
+    my $names  = eval {$dbh->selectcol_arrayref("select name from metadata,path where metadata.inode=path.inode and $where")};
+    if ($@) {
+	my $msg = $@;
+	$msg   =~ s/\s+at.+$//;
+	$msg =~ s![\n/] !!g;
+	return ('.','..',$msg);
+    } 
+    return ('.','..',@$names);
+}
+
+sub get_dynamic_entries {
+    my $self = shift;
+    my ($inode,$path) = @_;
+
+    return $self->_get_cached_dynamic_entries($inode,$path)
+	|| $self->_set_cached_dynamic_entries($inode,$path);
+}
+
+sub _get_cached_dynamic_entries {
+    my $self = shift;
+    my ($inode,$path) = @_;
+
+    my $dbh   = $self->dbh;
+    my $query = <<END;
+select inode,name,parent
+  from dynamic_cache
+   where directory=? and time>=?
+END
+;
+    my (%matches,%seenit);
+    eval {
+	my $sth = $dbh->prepare_cached($query);
+	$sth->execute($inode,time()-1); # cache time 1s at most
+
+	while (my ($file_inode,$name,$parent)=$sth->fetchrow_array) {
+	    $name .= '('.($seenit{$name}-1).')' if $seenit{$name}++;
+	    $matches{$name} = [$file_inode,$parent];
+	}
+    };
+    return unless %matches;
+    return \%matches;
+}
+
+sub _set_cached_dynamic_entries {
+    my $self = shift;
+    my ($inode,$path) = @_;
+
+    my $dbh   = $self->dbh;
+
+    # create a temporary table to hold the results
+    $dbh->do(<<END);
+create temporary table if not exists dynamic_cache 
+     (directory integer,
+      time      integer,
+      inode     integer,
+      name      varchar(255),
+      parent    integer)
+END
+;
+
+    $dbh->do("delete from dynamic_cache where directory=$inode");
+
+    # look for a file named .query
+    my ($query_inode) = 
+	$dbh->selectrow_array("select inode from path where name='.query' and parent=$inode");
+    return unless $query_inode;
+
+    # fetch the query
+    my $sql   = $self->read(undef,4096,0,$query_inode) or return;
+    $sql =~ s/#.+\n//g;
+
+    # run the query
+    my $isdir = 0x4000;
+    my $query = <<END;
+insert into dynamic_cache (directory,time,inode,name,parent)
+ select ?,?,p.inode,p.name,p.parent 
+ from path as p,metadata as m
+   where p.inode=m.inode 
+     and ($isdir&m.mode)=0 
+       and p.inode in ($sql)
+END
+    ;;
+    my $sth;
+    eval {
+	$sth   = $dbh->prepare($query);
+	$sth->execute($inode,time());
+    };	    
+
+    my $error_file = "$path/SQL_ERROR";
+    if ($@) {
+	my $msg = $@;
+	eval {
+	    my ($i) = eval {$self->_path2inode($error_file)};
+	    $i    ||= $self->mknod($error_file,0444,0);
+	    $self->ftruncate($error_file,0,$i);
+	    $self->write($error_file,$msg,0,$i);
+	};
+	warn $@ if $@;
+	return;
+    } else {
+	eval{
+	    $self->unlink($error_file) if $self->_path2inode($error_file);
+	};
+    }
+    $sth->finish;
+    return $self->_get_cached_dynamic_entries($inode,$path);
 }
 
 =head2 $boolean = $fs->isdir($path)
@@ -937,6 +1118,13 @@ sub _isdir {
     my ($result) = $dbh->selectrow_array("select ($mask&mode)=$isdir from metadata where inode=$inode")
 	or die $dbh->errstr;
     return $result;
+}
+
+sub _is_dynamic_dir {
+    my $self = shift;
+    my ($inode,$path) = @_;
+    return unless $path;
+    return $path =~ m!(?:^|/)%%[^/]+$! && $self->_isdir($inode) 
 }
 
 =head2 $fs->chown($path,$uid,$gid)
@@ -1023,8 +1211,8 @@ The returned list will contain:
 sub fgetattr {
     my $self  = shift;
     my ($path,$inode) = @_;
-    $inode ||= $self->path2inode;
-    my $dbh          = $self->dbh;
+    $inode  ||= $self->path2inode($path);
+    my $dbh   = $self->dbh;
     my ($ino,$mode,$uid,$gid,$rdev,$nlinks,$ctime,$mtime,$atime,$size) =
 	$dbh->selectrow_array($self->_fgetattr_sql($inode));
     $ino or die 'not found';
@@ -1138,7 +1326,7 @@ sub read {
     my $get_atime = $self->_get_unix_timestamp_sql('atime');
     my $get_mtime = $self->_get_unix_timestamp_sql('mtime');
     my ($current_length,$atime,$mtime) = 
-	$self->dbh->selectrow_array("select length,$get_atime,$get_mtime from metadata where inode=$inode");
+	$self->dbh->selectrow_array("select size,$get_atime,$get_mtime from metadata where inode=$inode");
     if ($length+$offset > $current_length) {
 	$length = $current_length - $offset;
     }
@@ -1165,7 +1353,6 @@ level. This checking is performed in the (optional) open() call.
 sub write {
     my $self = shift;
     my ($path,$data,$offset,$inode) = @_;
-
     $inode || defined $path or croak "no path or inode provided";
 
     unless ($inode) {
@@ -1227,7 +1414,7 @@ sub _write_blocks {
     my ($inode,$blocks,$blksize) = @_;
 
     my $dbh = $self->dbh;
-    my ($length) = $dbh->selectrow_array("select length from metadata where inode=$inode");
+    my ($length) = $dbh->selectrow_array("select size from metadata where inode=$inode");
     my $hwm      = $length;  # high water mark ;-)
 
     eval {
@@ -1244,7 +1431,7 @@ END
 	}
 	$sth->finish;
 	my $now = $self->_now_sql;
-	$dbh->do("update metadata set length=$hwm,mtime=$now where inode=$inode");
+	$dbh->do("update metadata set size=$hwm,mtime=$now where inode=$inode");
 	$dbh->commit();
     };
 
@@ -1278,7 +1465,7 @@ sub flush {
     # if called with no inode, then recursively call ourselves
     # to flush all cached inodes
     unless ($inode) {
-	for my $i (keys %{$self->{blockbuff}}) {
+	for my $i (keys %Blockbuff) {
 	    $self->flush(undef,$i);
 	}
 	return;
@@ -1372,7 +1559,7 @@ sub ftruncate {
 	$dbh->begin_work;
 	$dbh->do("delete from extents where inode=$inode and block>$last_block");
 	$dbh->do("update      extents set contents=substr(contents,1,$trunc) where inode=$inode and block=$last_block");
-	$dbh->do("update metadata set length=$length where inode=$inode");
+	$dbh->do("update metadata set size=$length where inode=$inode");
 	$self->touch($inode,'mtime');
 	$dbh->commit;
     };
@@ -1530,7 +1717,7 @@ metadata:
  | rdev   | int(10)    | YES  |     | 0                   |                |
  | links  | int(10)    | YES  |     | 0                   |                |
  | inuse  | int(10)    | YES  |     | 0                   |                |
- | length | bigint(20) | YES  |     | 0                   |                |
+ | size   | bigint(20) | YES  |     | 0                   |                |
  | mtime  | timestamp  | NO   |     | 0000-00-00 00:00:00 |                |
  | ctime  | timestamp  | NO   |     | 0000-00-00 00:00:00 |                |
  | atime  | timestamp  | NO   |     | 0000-00-00 00:00:00 |                |
@@ -1663,7 +1850,7 @@ containing "holes") to be stored efficiently: Blocks that fall within
 holes are completely absent from the table, while those that lead into
 a hole are shorter than the full block length.
 
-The logical length of the file is stored in the metadata length
+The logical length of the file is stored in the metadata size
 column.
 
 If you have subclassed DBI::Filesystem and wish to adjust the default
@@ -1675,11 +1862,11 @@ you please.
 
 sub initialize_schema {
     my $self = shift;
-    local $self->{dbh};  # to avoid cloning database handle into child threads
     my $dbh  = $self->dbh;
-    $dbh->do('drop table if exists metadata') or croak $dbh->errstr;
-    $dbh->do('drop table if exists path')     or croak $dbh->errstr;
-    $dbh->do('drop table if exists extents')  or croak $dbh->errstr;
+    $dbh->do('drop table if exists metadata')   or croak $dbh->errstr;
+    $dbh->do('drop table if exists path')       or croak $dbh->errstr;
+    $dbh->do('drop table if exists extents')    or croak $dbh->errstr;
+    $dbh->do('drop table if exists sqlfs_vars') or croak $dbh->errstr;
     eval{$dbh->do('drop index if exists iblock')};
     eval{$dbh->do('drop index if exists ipath')};
 
@@ -1687,6 +1874,7 @@ sub initialize_schema {
     $dbh->do($_) foreach split ';',$self->_metadata_table_def;
     $dbh->do($_) foreach split ';',$self->_path_table_def;
     $dbh->do($_) foreach split ';',$self->_extents_table_def;
+    $dbh->do($_) foreach split ';',$self->_variables_table_def;
 
     # create the root node
     # should update this to use fuse_get_context to get proper uid, gid and masked permissions
@@ -1700,7 +1888,16 @@ sub initialize_schema {
 	or croak $dbh->errstr;
     $dbh->do("insert into path (inode,name,parent) values (1,'/',null)")
 	or croak $dbh->errstr;
+    $self->set_schema_version($self->schema_version);
 }
+
+=head2 $ok = $fs->check_schema
+
+This method is called when opening a preexisting database. It checks
+that the metadata, path and extents tables exist in the database and
+have the expected relationships. Returns true if the check passes.
+
+=cut
 
 sub check_schema {
     my $self     = shift;
@@ -1713,7 +1910,111 @@ END
     return !$@;
 }
 
-=head2 $size = $fs->blocksize
+=head2 $version = $fs->schema_version
+
+This method returns the schema version understood by this module. It
+is used when opening up a sqlfs databse to check whether database was
+created by an earlier or later version of the software. The schema
+version is distinct from the library version since updates to the library
+do not always necessitate updates to the schema.
+
+Versions are small integers beginning at 1.
+
+=cut
+
+sub schema_version {
+    return SCHEMA_VERSION;
+}
+
+=head2 $version = $fs->get_schema_version
+
+This returns the schema version known to a preexisting database.
+
+=cut
+
+sub get_schema_version {
+    my $self = shift;
+    my ($result) = eval { $self->dbh->selectrow_array("select value from sqlfs_vars where name='schema_version'") };
+    return $result || 1;
+}
+
+=head2 $fs->set_schema_version($version)
+
+This sets the databases's schema version to the indicated value.
+
+=cut
+
+sub set_schema_version {
+    my $self = shift;
+    my $version = shift;
+    $self->dbh->do("replace into sqlfs_vars (name,value) values ('schema_version','$version')");
+}
+
+=head2 $fs->check_schema_version 
+
+This checks whether the schema version in a preexisting database is
+compatible with the version known to the library. If the version is
+from an earlier version of the library, then schema updating will be
+attempted. If the database was created by a newer version of the
+software, the method will raise a fatal exception.
+
+=cut
+
+sub check_schema_version {
+    my $self = shift;
+    my $current_version = $self->schema_version;
+    my $db_version      = $self->get_schema_version;
+    return if $current_version == $db_version;
+    die "This module understands schema version $current_version, but database was created with schema version $db_version"
+	if $db_version > $current_version;
+    # otherwise we evolve...
+    my $ok = 1;
+    for (my $i=$db_version;$i<$current_version;$i++) {
+	print STDERR "Updating database schema from $i to ",$i+1,"...\n";
+	my $method = "_update_schema_from_${i}_to_".($i+1);
+	$ok &&= eval{$self->$method};
+	warn $@ if $@;
+    }
+    die "Update failed" unless $ok;
+    eval {$self->dbh->do($_)} foreach split ';',$self->_variables_table_def;
+    $self->set_schema_version($self->schema_version);
+}
+
+###### schema update statements ######
+
+=head2 $fs->_update_schema_from_A_to_B
+
+Every update to this library that defines a new schema version has a
+series of methods named _update_schema_from_A_to_B(), where A and B are
+sequential version numbers. For example, if the current schema version
+is 3, then the library will define the following methods:
+
+ $fs->_update_schema_from_1_to_2
+ $fs->_update_schema_from_2_to_3
+
+These methods are only of interests to people who want to write
+adapters for DBMS engines that are not currently supported, such as
+Oracle.
+
+=cut
+
+sub _update_schema_from_1_to_2 {
+    my $self = shift;
+    my $dbh  = $self->dbh;
+    $dbh->do('alter table metadata change column length size bigint default 0');
+    $dbh->do($self->_variables_table_def);
+}
+
+sub _variables_table_def {
+    return <<END;
+create table sqlfs_vars (
+    name   varchar(255) primary key,
+    value  varchar(255)
+)
+END
+}
+
+=Head2 $size = $fs->blocksize
 
 This method returns the blocksize (currently 4096 bytes) used for
 writing and retrieving file contents to the extents table. Because
@@ -1991,7 +2292,7 @@ END
 Given a file or directory's inode and the access mode (a bitwise OR of
 R_OK, W_OK, X_OK), checks whether the current user is allowed
 access. This will return if access is allowed, or raise a fatal error
-otherwise.
+potherwise.
 
 =cut
 
@@ -2062,11 +2363,32 @@ passing an invalid path will return a "path not found" error.
 sub path2inode {
     my $self   = shift;
     my $path   = shift;
-    my ($inode,$p_inode,$name) = $self->_path2inode($path);
+
+    my $dynamic;
+    my ($inode,$p_inode,$name) = eval {	$self->_path2inode($path)};
+    unless ($inode) {
+	($inode,$p_inode,$name) = $self->_dynamic_path2inode($path);
+	$dynamic++ if $inode;
+    }
+    croak "$path not found" unless $inode;
 
     my $ctx = $self->get_context;
     $self->check_path($self->_dirname($path),$p_inode,@{$ctx}{'uid','gid'}) or die "permission denied";
-    return wantarray ? ($inode,$p_inode,$name) : $inode;
+    return wantarray ? ($inode,$p_inode,$name,$dynamic) : $inode;
+}
+
+sub _dynamic_path2inode {
+    my $self = shift;
+    my $path      = shift;
+    return unless $self->allow_magic_dirs;
+    my $dirname     = $self->_dirname($path);
+    my $basename    = basename($path);
+    my ($dir_inode) = $self->_path2inode($dirname)   or return;
+    $self->_is_dynamic_dir($dir_inode,$dirname)   or return;
+    my $entries = $self->get_dynamic_entries($dir_inode,$dirname);
+    $entries->{$basename}                         or return;
+    my ($inode,$parent) = @{$entries->{$basename}};
+    return ($inode,$parent,$basename);
 }
 
 sub _path2inode {
@@ -2225,7 +2547,7 @@ sub _fgetattr_sql {
     my $times = join ',',map{$self->_get_unix_timestamp_sql($_)} 'ctime','mtime','atime';
     return <<END;
 select inode,mode,uid,gid,rdev,links,
-       $times,length
+       $times,size
  from metadata
  where inode=$inode
 END
