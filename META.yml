@@ -15,7 +15,7 @@ name: sqlfs-perl
 provides:
   DBI::Filesystem:
     file: lib/DBI/Filesystem.pm
-    version: 1.02
+    version: 1.03
   DBI::Filesystem::DBD::Pg:
     file: lib/DBI/Filesystem/DBD/Pg.pm
     version: 0
@@ -31,4 +31,4 @@ requires:
   threads: 0
 resources:
   license: http://dev.perl.org/licenses/
-version: 1.02
+version: 1.03

@@ -175,7 +175,7 @@ The following methods are most likely to be needed by users of this module.
 use strict;
 use warnings;
 use DBI;
-use Fuse 'fuse_get_context';
+use Fuse 'fuse_get_context',':xattr';
 use threads;
 use threads::shared;
 use File::Basename 'basename','dirname';
@@ -185,9 +185,10 @@ use POSIX qw(ENOENT EISDIR ENOTDIR ENOTEMPTY EINVAL ECONNABORTED EACCES EIO EPER
              S_IXUSR S_IXGRP S_IXOTH);
 use Carp 'croak';
 
-our $VERSION = '1.02';
+our $VERSION = '1.03';
 
-use constant SCHEMA_VERSION => 2;
+use constant SCHEMA_VERSION => 3;
+use constant ENOATTR      => ENOENT;  # not sure this is right?
 use constant MAX_PATH_LEN => 4096;  # characters
 use constant BLOCKSIZE    => 16384;  # bytes
 use constant FLUSHBLOCKS  => 256;    # flush after we've accumulated this many cached blocks
@@ -390,6 +391,8 @@ sub mount {
 	readlink    => "$pkg\:\:e_readlink",
 	unlink      => "$pkg\:\:e_unlink",
 	utime       => "$pkg\:\:e_utime",
+	getxattr    => "$pkg\:\:e_getxattr",
+	listxattr   => "$pkg\:\:e_listxattr",
 	nullpath_ok => 1,
 	debug       => 0,
 	threaded    => 1,
@@ -415,6 +418,7 @@ sub _subclass_implemented_calls{
 
     my $pkg  = __PACKAGE__;
     foreach my $method (@implemented) {
+	next if $self->can("e_$method");  # don't overwrite
 	my $hook = "$pkg\:\:e_$method";
 	eval <<END;
 sub $hook {
@@ -476,22 +480,22 @@ method in your subclass.
 
 These are the hooks that are defined:
 
- e_getdir       e_open           e_access      e_unlink
+ e_getdir       e_open           e_access      e_unlink     e_removexattr
  e_getattr      e_release        e_rename      e_rmdir
  e_fgetattr     e_flush          e_chmod       e_utime
- e_mkdir        e_read           e_chown
- e_mknod        e_write          e_symlink
- e_create       e_truncate       e_readlink
+ e_mkdir        e_read           e_chown       e_getxattr
+ e_mknod        e_write          e_symlink     e_setxattr
+ e_create       e_truncate       e_readlink    e_listxattr
 
 These hooks will be created as needed if a subclass implements the
 corresponding methods:
 
  e_statfs       e_lock            e_init 
  e_fsync        e_opendir         e_destroy 
- e_setxattr     e_readdir         e_utimens
- e_getxattr     e_releasedir      e_bmap 
- e_listxattr    e_fsyncdir        e_ioctl 
- e_removexattr  e_poll
+ e_readdir      e_utimens
+ e_releasedir   e_bmap 
+ e_fsyncdir     e_ioctl 
+ e_poll
 
 =cut
 
@@ -507,6 +511,24 @@ sub e_getattr {
     my @stat  = eval {$Self->getattr($path)};
     return $Self->errno($@) if $@;
     return @stat;
+}
+
+# the {get,list}xattr methods call for a bit of finessing of return values
+#
+sub e_getxattr {
+    my $path = fixup(shift);
+    my $name = shift;
+    my $val  = eval {$Self->getxattr($path,$name)};
+    return $Self->errno($@) if $@;
+    return 0 unless defined $val;
+    return $val
+}
+
+sub e_listxattr {
+    my $path = fixup(shift);
+    my @val  = eval {$Self->listxattr($path)};
+    return $Self->errno($@) if $@;
+    return (@val,0);
 }
 
 sub e_fgetattr {
@@ -940,22 +962,40 @@ characters "%%" then getdir will look for a dotfile named ".query"
 within the directory. ".query" must contain a SQL query that returns a
 series of one or more inodes. These will be used to populate the
 directory automagically. The query can span multiple lines, and 
-lines that begin with "#" will be ignored. For example:
+lines that begin with "#" will be ignored.
 
- # display all files greater than 2 Mb in size
+Here is a simple example which will run on all DBMSs. It displays all
+files with size greater than 2 Mb:
+
  select inode from metadata where size>2000000
 
 Another example, which uses MySQL-specific date/time
-math:
+math to find all .jpg files created/modified within the last day:
 
- # all .jpg files created/modified within the last day
  select m.inode from metadata as m,path as p
      where p.name like '%.jpg'
        and (now()-interval 1 day) <= m.mtime
        and m.inode=p.inode
 
-Magic directories only populate files. Directories are excluded
-because of cycle issues.
+(The date/time math syntax is very slightly different for PostgreSQL
+and considerably different for SQLite)
+
+An example that uses extended attributes to search for all documents
+authored by someone with "Lincoln" in the name:
+
+ select m.inode from metadata as m,xattr as x
+    where x.name == 'user.Author'
+     and x.value like 'Lincoln%'
+     and m.inode=x.inode
+    
+The files contained within the magic directories can be read and
+written just like normal files, but cannot be removed or
+renamed. Directories are excluded from magic directories. If two or
+more files from different parts of the filesystem have name clashes,
+the filesystem will append a number to their end to distinguish them.
+
+If the SQL contains an error, then the error message will be contained
+within a file named "SQL_ERROR".
 
 =cut
 
@@ -1669,8 +1709,111 @@ sub errno {
     return -EINVAL()    if $message =~ /length beyond end of file/;
     return -ENOTEMPTY() if $message =~ /not empty/;
     return -EACCES()    if $message =~ /permission denied/;
+    return -ENOATTR()   if $message =~ /no such attribute/;
+    return -EEXIST()    if $message =~ /attribute exists/;
     warn $message;      # something unexpected happened!
     return -EIO();
+}
+
+=head2 $result = $fs->setxattr($path,$name,$val,$flags)
+
+This method sets the extended attribute named $name to the value
+indicated by $val for the file or directory in $path. The Fuse
+documentation states that $flags will be one of XATTR_REPLACE or
+XATTR_CREATE, but in my testing I have only seen the value 0 passed.
+
+On success, the method returns 0.
+
+=cut
+
+sub setxattr {
+    my $self = shift;
+    my ($path,$xname,$xval,$xflags) = @_;
+    my $inode = $self->path2inode($path);
+    my $dbh = $self->dbh;
+    if (!$xflags) {
+	my $sql = 'replace into xattr (inode,name,value) values (?,?,?)';
+	my $sth = $dbh->prepare_cached($sql);
+	$sth->execute($inode,$xname,$xval);
+	$sth->finish;
+    }
+    elsif ($xflags&XATTR_REPLACE) {
+	my $sql = 'update xattr set value=? where inode=? and name=?';
+	my $sth = $dbh->prepare_cached($sql);
+	my $rows = eval {$sth->execute($xval,$inode,$xname)};
+	$sth->finish;
+	die "no such attribute" unless $rows>0;
+    }
+    elsif ($xflags&XATTR_CREATE) {
+	my $sql = 'insert into xattr (inode,name,value) values (?,?,?)';
+	my $sth = $dbh->prepare_cached($sql);
+	eval {$sth->execute($inode,$xname,$xval)};
+	die "attribute exists" if $@ =~ /not unique|duplicate/i;
+	$sth->finish;
+    } else {
+	die "Can't interpret value of setxattr flags=$xflags";
+    }
+    return 0;
+}
+
+=head2 $val = $fs->getxattr($path,$name)
+
+Reads the extended attribute named $name from the file or directory at
+$path and returns the value. Will return undef if the attribute not
+found.
+
+Note that when the filesystem is mounted, the Fuse interface provides
+no way to distinguish between an attribute that does not exist versus
+one that does exist but has value "0". The only workaround for this is
+to use "attr -l" to list the attributes and look for the existence of
+the desired attribute.
+
+
+=cut
+
+sub getxattr {
+    my $self = shift;
+    my ($path,$xname) = @_;
+    my $inode = $self->path2inode($path);
+    my $dbh   = $self->dbh;
+    my $name  = $dbh->quote($xname);
+    my ($value) = $dbh->selectrow_array("select value from xattr where inode=$inode and name=$name");
+    return $value;
+}
+
+=head2 @attribute_names = $fs->listxattr($path)
+
+List all xattributes for the file or directory at the indicated path
+and return them as a list.
+
+=cut
+
+sub listxattr {
+    my $self = shift;
+    my $path = shift;
+    my $inode = $self->path2inode($path);
+    my $names = $self->dbh->selectcol_arrayref("select name from xattr where inode=$inode");
+    $names ||= [];
+    return @$names;
+}
+
+=head2 $fs->removexattr($path,$name)
+
+Remove the attribute named $name for path $path. Will raise a "no such
+attribute" error if then if the attribute does not exist.
+
+=cut
+
+sub removexattr {
+    my $self = shift;
+    my ($path,$xname) = @_;
+    my $dbh = $self->dbh;
+    my $inode = $self->path2inode($path);
+    my $sth   = $dbh->prepare_cached("delete from xattr where inode=? and name=?");
+    $sth->execute($inode,$xname);
+    $sth->rows > 0 or die "no such attribute named $xname";
+    $sth->finish;
+    return 0;
 }
 
 =head1 LOW LEVEL METHODS
@@ -1867,6 +2010,7 @@ sub initialize_schema {
     $dbh->do('drop table if exists path')       or croak $dbh->errstr;
     $dbh->do('drop table if exists extents')    or croak $dbh->errstr;
     $dbh->do('drop table if exists sqlfs_vars') or croak $dbh->errstr;
+    $dbh->do('drop table if exists xattr')      or croak $dbh->errstr;
     eval{$dbh->do('drop index if exists iblock')};
     eval{$dbh->do('drop index if exists ipath')};
 
@@ -1875,6 +2019,7 @@ sub initialize_schema {
     $dbh->do($_) foreach split ';',$self->_path_table_def;
     $dbh->do($_) foreach split ';',$self->_extents_table_def;
     $dbh->do($_) foreach split ';',$self->_variables_table_def;
+    $dbh->do($_) foreach split ';',$self->_xattr_table_def;
 
     # create the root node
     # should update this to use fuse_get_context to get proper uid, gid and masked permissions
@@ -1903,11 +2048,9 @@ sub check_schema {
     my $self     = shift;
     local $self->{dbh};  # to avoid cloning database handle into child threads
     my ($result) = eval {
-	$self->dbh->selectrow_array(<<END);
-select 1 from metadata as m,path as p left join extents as e on e.inode=p.inode where m.inode=1 and p.parent=1
-END
+ 	$self->dbh->selectrow_array('select 1 from metadata as m,path as p left join extents as e on e.inode=p.inode where m.inode=1 and p.parent=1');
     };
-    return !$@;
+     return !$@;
 }
 
 =head2 $version = $fs->schema_version
@@ -1970,7 +2113,7 @@ sub check_schema_version {
     # otherwise we evolve...
     my $ok = 1;
     for (my $i=$db_version;$i<$current_version;$i++) {
-	print STDERR "Updating database schema from $i to ",$i+1,"...\n";
+	print STDERR "Updating database schema from version $i to version ",$i+1,"...\n";
 	my $method = "_update_schema_from_${i}_to_".($i+1);
 	$ok &&= eval{$self->$method};
 	warn $@ if $@;
@@ -2003,6 +2146,14 @@ sub _update_schema_from_1_to_2 {
     my $dbh  = $self->dbh;
     $dbh->do('alter table metadata change column length size bigint default 0');
     $dbh->do($self->_variables_table_def);
+    1;
+}
+
+sub _update_schema_from_2_to_3 {
+    my $self = shift;
+    my $dbh  = $self->dbh;
+    $dbh->do($_) foreach split ';',$self->_xattr_table_def;
+    1;
 }
 
 sub _variables_table_def {
@@ -2558,6 +2709,7 @@ sub _create_inode_sql {
     my $now = $self->_now_sql;
     return "insert into metadata (mode,uid,gid,rdev,links,mtime,ctime,atime) values(?,?,?,?,?,$now,$now,$now)";
 }
+
 
 1;
 

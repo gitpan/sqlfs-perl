@@ -30,7 +30,7 @@
    "provides" : {
       "DBI::Filesystem" : {
          "file" : "lib/DBI/Filesystem.pm",
-         "version" : "1.02"
+         "version" : "1.03"
       },
       "DBI::Filesystem::DBD::Pg" : {
          "file" : "lib/DBI/Filesystem/DBD/Pg.pm",
@@ -51,5 +51,5 @@
          "http://dev.perl.org/licenses/"
       ]
    },
-   "version" : "1.02"
+   "version" : "1.03"
 }
