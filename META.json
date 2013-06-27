@@ -4,7 +4,7 @@
       "Lincoln Stein <lincoln.stein@oicr.on.ca>"
    ],
    "dynamic_config" : 1,
-   "generated_by" : "Module::Build version 0.38, CPAN::Meta::Converter version 2.110440",
+   "generated_by" : "Module::Build version 0.4005, CPAN::Meta::Converter version 2.112621",
    "license" : [
       "perl_5"
    ],
@@ -30,7 +30,7 @@
    "provides" : {
       "DBI::Filesystem" : {
          "file" : "lib/DBI/Filesystem.pm",
-         "version" : "1.03"
+         "version" : "1.04"
       },
       "DBI::Filesystem::DBD::Pg" : {
          "file" : "lib/DBI/Filesystem/DBD/Pg.pm",
@@ -51,5 +51,5 @@
          "http://dev.perl.org/licenses/"
       ]
    },
-   "version" : "1.03"
+   "version" : "1.04"
 }
